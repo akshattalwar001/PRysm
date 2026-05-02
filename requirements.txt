@@ -1,0 +1,7 @@
+fastapi
+uvicorn
+groq
+PyGithub
+python-dotenv
+httpx
+pytest
