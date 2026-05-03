@@ -53,7 +53,7 @@ async def handle_webhook(request: Request):
 
         print(f"[CONTEXT] Split into {len(prompt_chunks)} chunk(s)")
         
-        review_data = review_chunks(prompt_chunks)
+        review_data = await review_chunks(prompt_chunks, repo=repo, pr_number=pr_number)
         
         review_data = attach_diff_positions(review_data, raw_diff)
         post_review(repo, pr_number, review_data)
