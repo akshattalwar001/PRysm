@@ -5,4 +5,4 @@ PyGithub
 python-dotenv
 httpx
 pytest
-himdsight-client
+hindsight-client
