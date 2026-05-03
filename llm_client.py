@@ -1,22 +1,99 @@
 import json
 import re
+import asyncio
+from concurrent.futures import ThreadPoolExecutor
 from groq import Groq
-from config import GROQ_API_KEY
+from hindsight_client import Hindsight
+from config import GROQ_API_KEY, HINDSIGHT_API_URL, HINDSIGHT_API_KEY
 
 client = Groq(api_key=GROQ_API_KEY)
-MODEL = "llama-3.1-8b-instant"
+MODEL = "llama-3.3-70b-versatile"
+
+hindsight = Hindsight(
+    base_url=HINDSIGHT_API_URL,
+    api_key=HINDSIGHT_API_KEY,
+)
+
+_executor = ThreadPoolExecutor(max_workers=2)
+
+def _run_in_thread(fn, *args, **kwargs):
+    """
+    FastAPI runs an async event loop. Hindsight sync SDK calls block it.
+    This runs them in a separate thread to avoid the conflict.
+    """
+    loop = asyncio.get_event_loop()
+    return loop.run_in_executor(_executor, lambda: fn(*args, **kwargs))
+
+def _create_bank(bank_id: str, repo: str):
+    try:
+        hindsight.create_bank(
+            bank_id=bank_id,
+            name=repo,
+            background=f"PR review memory system for the repository {repo}. Stores past pull request reviews, recurring bugs, code patterns, and common issues found in this codebase.",
+        )
+        print(f"[Hindsight] Created memory bank for repo: {repo}")
+    except Exception as e:
+        print(f"[Hindsight] Bank already exists or creation skipped: {e}")
+
+
+def _fetch(bank_id: str, query: str):
+    return hindsight.recall(bank_id=bank_id, query=query)
+
+
+def _store(bank_id: str, content: str):
+    hindsight.retain(bank_id=bank_id, content=content)
+
+
+async def create_bank_if_not_exists(repo: str) -> None:
+    bank_id = repo.replace("/", "-")
+    await _run_in_thread(_create_bank, bank_id, repo)
+
+
+async def fetch_memories(repo: str, query: str) -> str:
+    try:
+        bank_id = repo.replace("/", "-")
+        result = await _run_in_thread(_fetch, bank_id, query)
+
+        if not result.results:
+            return ""
+
+        memory_lines = "\n".join(f"- {m.text}" for m in result.results)
+        return f"\n\n### Past review memory for this repo:\n{memory_lines}\n"
+
+    except Exception as e:
+        print(f"[Hindsight] fetch_memories failed (non-fatal): {e}")
+        return ""
+
+
+async def store_memory(repo: str, pr_number: int, review_data: dict) -> None:
+    try:
+        bank_id = repo.replace("/", "-")
+        tldr = review_data.get("summary", {}).get("tldr", "")
+        score = review_data.get("summary", {}).get("overall_score", "?")
+        verdict = review_data.get("summary", {}).get("verdict", "?")
+        issues = [c["comment"] for c in review_data.get("inline_comments", [])[:3]]
+
+        memory_text = (
+            f"PR #{pr_number}: verdict={verdict}, score={score}/10. "
+            f"Summary: {tldr}"
+        )
+        if issues:
+            memory_text += " Key issues: " + " | ".join(issues)
+
+        await _run_in_thread(_store, bank_id, memory_text)
+        print(f"[Hindsight] Stored memory for PR #{pr_number} in bank: {bank_id}")
+
+    except Exception as e:
+        print(f"[Hindsight] store_memory failed (non-fatal): {e}")
+
 
 def _extract_json(text: str) -> dict:
-    """
-    Llama sometimes wraps JSON in ```json ... ``` even when told not to.
-    this function tries to extract the JSON object from the raw text.
-    """
     try:
         return json.loads(text.strip())
     except json.JSONDecodeError:
         pass
 
-    match = re.search(r"```(?:json)?\s*([\s\S]*?)```", text) 
+    match = re.search(r"```(?:json)?\s*([\s\S]*?)```", text)
     if match:
         try:
             return json.loads(match.group(1).strip())
@@ -25,36 +102,13 @@ def _extract_json(text: str) -> dict:
 
     raise ValueError(f"Could not extract valid JSON from response:\n{text[:500]}")
 
-"""input prompt example :"You are a senior software engineer reviewing 
-                           a pull request.\n\nPR Title: Add auth..." 
-                           
-output of call_llm(prompt):
-{
-    "summary": {
-        "verdict": "request_changes",
-        "overall_score": 6,
-        "tldr": "Auth logic has a SQL injection risk on line 42."
-    },
-    "inline_comments": [
-        {
-            "file": "src/auth.py",
-            "line": 42,
-            "severity": "security",
-            "comment": "User input is directly interpolated into the SQL query."
-        }
-    ],
-    "general_comments": ["Add unit tests for the login function."]
-}
-
-"""
 def call_llm(prompt: str) -> dict:
-
     messages = [{"role": "user", "content": prompt}]
 
     response = client.chat.completions.create(
         model=MODEL,
         messages=messages,
-        temperature=0.2,  
+        temperature=0.2,
         max_tokens=2048,
     )
 
@@ -84,47 +138,22 @@ def call_llm(prompt: str) -> dict:
 
         retry_raw = retry_response.choices[0].message.content
         return _extract_json(retry_raw)
+    
 
-
-"""
-input example : prompt_chunks = [
-    {
-        "prompt": "You are a senior engineer... \n### File: src/auth.py\n...",
-        "files_covered": ["src/auth.py"]
-    },
-    {
-        "prompt": "You are a senior engineer... \n### File: src/routes.py\n...",
-        "files_covered": ["src/routes.py"]
-    }
-]
-
-output of review_chunks(prompt_chunks):
-{
-    "summary": {
-        "verdict": "request_changes",
-        "overall_score": 5,
-        "tldr": "Reviewed 2 chunk(s). See inline comments for details."
-    },
-    "inline_comments": [
-        # comments from chunk 1 AND chunk 2 combined
-        {"file": "src/auth.py", "line": 42, "severity": "security", "comment": "..."},
-        {"file": "src/routes.py", "line": 15, "severity": "bug", "comment": "..."}
-    ],
-    "general_comments": [
-        "Add unit tests.",
-        "Consider rate limiting the login endpoint."
-    ]
-}
-
-"""
-def review_chunks(prompt_chunks: list[dict]) -> dict:
-
+async def review_chunks(prompt_chunks: list[dict], repo: str = "", pr_number: int = 0) -> dict:
     if not prompt_chunks:
         return {
             "summary": {"verdict": "comment", "overall_score": 0, "tldr": "No reviewable files found."},
             "inline_comments": [],
             "general_comments": [],
         }
+
+    if repo:
+        await create_bank_if_not_exists(repo)
+
+    memory_context = await fetch_memories(repo, query=prompt_chunks[0]["prompt"][:300]) if repo else ""
+    if memory_context:
+        print(f"[Hindsight] Injected memory context into prompt")
 
     all_inline = []
     all_general = []
@@ -133,7 +162,8 @@ def review_chunks(prompt_chunks: list[dict]) -> dict:
 
     for chunk in prompt_chunks:
         print(f"[LLM] Reviewing files: {chunk['files_covered']}")
-        result = call_llm(chunk["prompt"])
+        enriched_prompt = chunk["prompt"] + memory_context
+        result = call_llm(enriched_prompt)
 
         all_inline.extend(result.get("inline_comments", []))
         all_general.extend(result.get("general_comments", []))
@@ -151,12 +181,17 @@ def review_chunks(prompt_chunks: list[dict]) -> dict:
     else:
         final_verdict = "approve"
 
-    return {
+    final_result = {
         "summary": {
             "verdict": final_verdict,
             "overall_score": final_score,
             "tldr": f"Reviewed {len(prompt_chunks)} chunk(s). See inline comments for details.",
         },
         "inline_comments": all_inline,
-        "general_comments": list(set(all_general)),  # remove duplicate general comments
+        "general_comments": list(set(all_general)),
     }
+
+    if repo and pr_number:
+        await store_memory(repo, pr_number, final_result)
+
+    return final_result
