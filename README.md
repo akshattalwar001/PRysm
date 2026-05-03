@@ -115,7 +115,7 @@ docker compose up --build
 server will be running at `http://localhost:8000`
 
 <p align="left">
-  <img src="https://i.imgur.com/h62KdA8.png" width="400"/>
+  <img src="https://i.imgur.com/UVF9WZG.png" width="400"/>
 </p>
 
 > docker image is also available at: https://hub.docker.com/repository/docker/akshattalwar/prysm-pr-review-agent
