@@ -114,6 +114,9 @@ server will be running at `http://localhost:8000`
 ---
 
 ### method 3   docker
+<p align="left">
+  <img src="https://i.imgur.com/kG8D27e.png" width="500"/>
+</p>
 
 **step 1** pull the image
 
